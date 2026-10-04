@@ -39,9 +39,16 @@ Two decorators wrap any backend: `NewTracedIndex` adds OpenTelemetry spans
 ## Grouped (HMA) Entries
 
 `GroupCatalog` tracks group identity for heterogeneous-memory-aware (HMA)
-models, where a block may be announced by a group of engines; eviction is
-reference-counted at the group level so a block is removed only once no group
-still references it.
+models. A `PodEntry` is one holder: `(pod, device tier)`, optionally carrying a
+group. For `full_attention` blocks the group is deliberately not part of the
+holder identity, because the engine serves such a block only when every group
+of the spec holds it (`BlockPool.get_cached_block` in
+`vllm/v1/core/block_pool.py:198-223`), so the groups are one cache rather than
+competing holders. Announcing one block per group (13 of 50 groups on a
+hybrid 48-layer model plus MTP) would otherwise multiply entries per key and
+let a single store evict every other pod under the per-key cap. Groups of
+other kinds keep `HasGroup`/`GroupIdx`, and eviction stays reference-counted
+per group so a block is dropped only once no announcement still holds it.
 
 ## Key Types
 
@@ -51,7 +58,7 @@ still references it.
 | `KeyWalker` / `EntryRef` | Optional ordered walk over requested keys; entries with pod and tier ordinals. |
 | `TokenProcessor` | Tokens -> block keys; exposes `BlockSize`. |
 | `BlockHash` | A single block key. |
-| `PodEntry` | A pod holding a block, with its device tier. |
+| `PodEntry` | A holder of a block: a pod and device tier, plus a group for the kinds where groups are separate holders. |
 | `BlockExtraFeatures` / `ComputeBlockExtraFeatures` | Per-block multimodal metadata folded into the hash. |
 | `PlaceholderRange` | Placeholder-token range for a multimodal item. |
 

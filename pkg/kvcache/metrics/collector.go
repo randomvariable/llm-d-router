@@ -40,6 +40,15 @@ const podIdentifierLabel = "pod_identifier"
 const (
 	cacheKindLabel = "cache_kind"
 	reasonLabel    = "reason"
+	indexMapLabel  = "map"
+)
+
+// Values of indexMapLabel, naming which InMemoryIndex LRU dropped an entry on
+// capacity. Keeping them exported lets the recording call sites and the tests
+// share one spelling.
+const (
+	MapRequestKeys         = "request_keys"
+	MapEngineToRequestKeys = "engine_to_request_keys"
 )
 
 // dualCounter emits a value to both the deprecated kvcache_* counter and the
@@ -112,6 +121,18 @@ var (
 		"kv_cache_index_admissions_total", "Total number of KV-block admissions")
 	Evictions = newDualCounter("index", "evictions_total",
 		"kv_cache_index_evictions_total", "Total number of KV-block evictions")
+	// CapacityEvictions counts entries the InMemoryIndex LRUs dropped because
+	// the index was full. Unlike Evictions, which records explicit wire
+	// removals, a capacity drop has no matching engine event, so the dedup
+	// filter over-counts and nothing else signals that the index has fallen
+	// behind what the engines still hold. New series: no deprecated kvcache_*
+	// alias is minted and it is not dual-emitted.
+	CapacityEvictions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_index_capacity_evictions_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"Total number of KV-block index entries dropped by LRU capacity, by map",
+			compbasemetrics.ALPHA),
+	}, []string{indexMapLabel})
 
 	// LookupRequests counts how many Lookup() calls have been made.
 	LookupRequests = newDualCounter("index", "lookup_requests_total",
@@ -209,7 +230,7 @@ var (
 // Collectors returns a slice of all registered Prometheus collectors.
 func Collectors() []prometheus.Collector {
 	return []prometheus.Collector{
-		Admissions, Evictions,
+		Admissions, Evictions, CapacityEvictions,
 		LookupRequests, LookupHits, LookupLatency, MaxPodHitCount,
 		DedupRemovedHashesSuppressed, DedupRemovedHashesForwarded,
 		KVEventStoresSkipped, KVEventRemovalsSkipped,

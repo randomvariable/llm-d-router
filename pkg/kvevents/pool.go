@@ -60,6 +60,25 @@ func isPrefixIndexableSpecKind(kind KVCacheSpecKind) bool {
 	}
 }
 
+// storesAsPodTierEntry reports whether blocks of this cache-spec kind are
+// announced once per KV cache group and are servable only when every group of
+// the spec holds them, so the groups form a single holder rather than
+// competing ones. vLLM's BlockPool.get_cached_block (vllm/v1/core/block_pool.py:198-223)
+// returns None when any group of the spec misses, and
+// HybridKVCacheCoordinator.find_longest_cache_hit
+// (vllm/v1/core/kv_cache_coordinator.py:778-911) takes the minimum hit length
+// across attention types. On the deployed hybrid model one stored block is
+// announced once per full-attention group (13 of 50 groups), so keying the
+// index holder by group multiplies per-key entries by the group count and lets
+// a single store evict every other pod's entry for that block.
+//
+// Scoping this to full_attention is deliberate: the rule is per spec, and
+// extending it to other per-spec-coupled kinds (MLA, sink-full) is a policy
+// decision that needs its own evidence.
+func storesAsPodTierEntry(kind KVCacheSpecKind) bool {
+	return kind == KVCacheSpecKindFullAttention
+}
+
 func cacheKindLabel(kind KVCacheSpecKind) string {
 	if kind == "" {
 		return string(KVCacheSpecKindUnknown)
@@ -586,8 +605,16 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 						SlidingWindowSize: ev.KVCacheSpecSlidingWindowSize,
 					})
 				}
-				podEntries[0].HasGroup = true
-				podEntries[0].GroupIdx = g
+				// Full-attention groups are one cache to the engine, so they
+				// index as one holder per (pod, tier). Dedup stays group-scoped
+				// (see storeScope above): announcements are per group, and the
+				// first group whose own count reaches zero forwards a removal
+				// that evicts this pod's holder for those keys. That asymmetry is
+				// what gives AND presence, matching the engine's hit rule.
+				if !storesAsPodTierEntry(ev.KVCacheSpecKind) {
+					podEntries[0].HasGroup = true
+					podEntries[0].GroupIdx = g
+				}
 			}
 
 			if digestible, reason := blockStoredEventDigestible(ev); !digestible {
@@ -613,6 +640,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				parentEngineKey := kvblock.BlockHash(ev.ParentHash)
 				key, err := p.index.GetRequestKey(ctx, parentEngineKey)
 				if err != nil {
+					metrics.KVEventStoresSkipped.WithLabelValues(cacheKindLabel(ev.KVCacheSpecKind), "unresolved_parent").Inc()
 					debugLogger.Error(err, "Failed to get request key for parent block",
 						"parentEngineKey", parentEngineKey,
 						"effectiveModelName", effectiveModelName,
@@ -703,16 +731,21 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 		case *BlockRemovedEvent:
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
+			// The group's cache-spec kind decides both whether the removal is
+			// indexable and which holder identity it must target, so resolve it
+			// once and reuse it below.
+			var groupKind KVCacheSpecKind
 			if ev.GroupIdx != nil {
 				groupIdx := kvblock.GroupID(*ev.GroupIdx)
 				meta, found := p.groupCatalog.Get(podIdentifier, groupIdx)
-				if !found || !isPrefixIndexableSpecKind(KVCacheSpecKind(meta.Kind)) {
+				groupKind = KVCacheSpecKind(meta.Kind)
+				if !found || !isPrefixIndexableSpecKind(groupKind) {
 					reason := "unsupported_cache_kind"
 					if !found {
 						reason = "unknown_group"
 					}
 					metrics.KVEventRemovalsSkipped.WithLabelValues(
-						cacheKindLabel(KVCacheSpecKind(meta.Kind)), reason).Inc()
+						cacheKindLabel(groupKind), reason).Inc()
 					log.FromContext(ctx).V(logging.TRACE).Info("Skipping KV cache remove event",
 						"podIdentifier", podIdentifier,
 						"groupIdx", groupIdx,
@@ -722,9 +755,12 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				}
 			}
 
-			// Create PodEntry for this specific event's device tier.
+			// Build the index holder with the same identity the store used, or
+			// the eviction would target an entry that was never written and the
+			// pod would stay matchable forever. normalizeDeviceTier above is the
+			// precedent for keeping these two sites in step.
 			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
-			if ev.GroupIdx != nil {
+			if ev.GroupIdx != nil && !storesAsPodTierEntry(groupKind) {
 				podEntries[0].HasGroup = true
 				podEntries[0].GroupIdx = kvblock.GroupID(*ev.GroupIdx)
 			}

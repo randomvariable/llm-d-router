@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 	. "github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
 
@@ -267,4 +269,40 @@ func TestAddWithNilEngineKeys(t *testing.T) {
 	// GetRequestKey should NOT find a mapping (no engineKey was stored)
 	_, err = index.GetRequestKey(ctx, requestKey)
 	assert.Error(t, err, "GetRequestKey should fail since no engineKey mapping was created")
+}
+
+
+// TestInMemoryIndexCapacityEvictionsCountLRUDropsOnly makes silent index
+// starvation observable: entries the LRUs drop on capacity have no matching
+// engine event, so without this counter a full index is indistinguishable from
+// an engine that simply does not hold the prefix. An explicit Evict is a wire
+// event and must not be counted.
+func TestInMemoryIndexCapacityEvictionsCountLRUDropsOnly(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+
+	read := func(label string) float64 {
+		return testutil.ToFloat64(metrics.CapacityEvictions.WithLabelValues(label))
+	}
+
+	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 2, PodCacheSize: 4})
+	require.NoError(t, err)
+
+	requestBefore, engineBefore := read(metrics.MapRequestKeys), read(metrics.MapEngineToRequestKeys)
+	for i := range 5 {
+		key := BlockHash(1000 + i) //nolint:gosec // test data
+		require.NoError(t, index.Add(ctx, []BlockHash{key}, []BlockHash{key},
+			[]PodEntry{{PodIdentifier: "pod1", DeviceTier: "gpu"}}))
+	}
+	assert.Greater(t, read(metrics.MapRequestKeys), requestBefore,
+		"adding past Size must record request-key capacity drops")
+	assert.Greater(t, read(metrics.MapEngineToRequestKeys), engineBefore,
+		"adding past Size must record engine-key capacity drops")
+
+	requestBefore, engineBefore = read(metrics.MapRequestKeys), read(metrics.MapEngineToRequestKeys)
+	require.NoError(t, index.Evict(ctx, BlockHash(1004), EngineKey,
+		[]PodEntry{{PodIdentifier: "pod1", DeviceTier: "gpu"}}))
+	assert.Equal(t, requestBefore, read(metrics.MapRequestKeys),
+		"explicit eviction is a wire event, not capacity pressure")
+	assert.Equal(t, engineBefore, read(metrics.MapEngineToRequestKeys),
+		"explicit eviction is a wire event, not capacity pressure")
 }

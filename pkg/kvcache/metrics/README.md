@@ -1,8 +1,9 @@
 # KV-Cache Metrics
 
 Prometheus collectors for the KV-cache subsystem: block-index admissions,
-evictions, and lookups, and the KV-event dedup filter's suppressed/forwarded
-removals.
+evictions (explicit and capacity-driven), and lookups, the KV-event dedup
+filter's suppressed/forwarded removals, and the counters for stores and
+removals skipped before indexing.
 
 ## What It Does
 

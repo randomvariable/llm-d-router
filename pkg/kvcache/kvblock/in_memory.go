@@ -30,6 +30,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/collections"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 )
 
 const (
@@ -354,7 +355,9 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	if engineKeys != nil {
 		mappings := engineToRequestMapping(engineKeys, requestKeys)
 		for ek, rks := range mappings {
-			m.engineToRequestKeys.Add(ek, rks)
+			if m.engineToRequestKeys.Add(ek, rks) {
+				metrics.CapacityEvictions.WithLabelValues(metrics.MapEngineToRequestKeys).Inc()
+			}
 		}
 	}
 
@@ -372,11 +375,16 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 			// Try to add, but use existing if another thread added it first
 			// This is a bounded retry (1) - not perfectly safe but for practical use-cases and scenarios
 			// this should be sufficient
-			contains, _ := m.data.ContainsOrAdd(requestKey, newPodCache)
+			contains, evicted := m.data.ContainsOrAdd(requestKey, newPodCache)
+			if evicted { // ContainsOrAdd only evicts when it added
+				metrics.CapacityEvictions.WithLabelValues(metrics.MapRequestKeys).Inc()
+			}
 			if contains {
 				podCache, found = m.data.Get(requestKey)
 				if !found { // Extremely irregular workload pattern - key evicted
-					m.data.Add(requestKey, newPodCache)
+					if m.data.Add(requestKey, newPodCache) {
+						metrics.CapacityEvictions.WithLabelValues(metrics.MapRequestKeys).Inc()
+					}
 					podCache = newPodCache
 				}
 			} else {
