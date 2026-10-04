@@ -15,13 +15,18 @@ Tracks real-time in-flight request and token counts per endpoint by hooking into
     - If `addEstimatedOutputTokens` is `false` (default): For streaming requests, all tokens are released as soon as the first chunk of the response is received (`StartOfStream`), as the prefill compute is complete. For non-streaming requests (or as a safety net), tokens are released when the response completes (`EndOfStream`).
     - If `addEstimatedOutputTokens` is `true`: The prompt portion is released at `StartOfStream` (for streaming) or `EndOfStream`, and the estimated output portion is released only when the response completes (`EndOfStream`).
 - **Request Release**: In-flight request counters are always released when the response completes (`EndOfStream`).
+- **Gauge Consistency**: The exported `llm_d_epp_inflight_requests` / `_tokens` gauges are only
+  moved while the entry's captured tracker is still the one registered for that endpoint. After an
+  endpoint departs, its series are pruned and its late releases land on the orphaned tracker
+  instance, so the live endpoint's exported values keep matching `GetRequests` / `GetTokens`.
 
 The producer hooks three lifecycle phases:
 - **Produce**: Writes current in-flight counts to each endpoint's attributes.
 - **PreRequest**: Increments counters when a request is dispatched to an endpoint.
 - **ResponseBody**: Decrements counters when a response completes or the request is aborted.
 
-Endpoint departure events (pod removed from the pool) are handled via the `EndpointExtractor` interface to clean up stale counters.
+Endpoint departure events (pod removed from the pool) are handled via the `EndpointExtractor`
+interface to clean up stale counters and to prune that endpoint's gauge series.
 
 ## Parameters
 

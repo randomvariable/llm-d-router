@@ -822,6 +822,105 @@ func TestPredictedLatency_ResponseBody_CleansUpContext_WhenPreRequestSkipped(t *
 	assert.Error(t, err, "SLO context should be removed at EOS even on the orphan path")
 }
 
+// TestPredictedLatency_ResponseBody_TpotUsesCompletionTokens is the regression
+// for the deployed predictor training 4x-inflated TPOT labels: under
+// speculative decoding a streamed chunk carries several tokens, so dividing the
+// decode window by the chunk count measures time per chunk. The label must come
+// from the reported completion tokens instead.
+func TestPredictedLatency_ResponseBody_TpotUsesCompletionTokens(t *testing.T) {
+	const (
+		chunks         = 10
+		completionTok  = 40
+		ttftMs         = 300.0
+		decodeWindowMs = 600.0
+	)
+
+	router := createTestRouter()
+	mock := new(mockPredictor)
+	router.latencypredictor = mock
+
+	ctx := context.Background()
+	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
+	request := createTestInferenceRequest("tpot-tokens", 100, 50)
+
+	predictedLatencyCtx := newPredictedLatencyContext(request)
+	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
+	predictedLatencyCtx.schedulingResult = createTestSchedulingResult(endpoint.GetMetadata())
+	predictedLatencyCtx.schedulingRequest = *request
+	predictedLatencyCtx.incomingModelName = testModelName
+	predictedLatencyCtx.lastSeenMetrics["default"] = &fwkdl.Metrics{
+		KVCacheUsagePercent: 0.5, WaitingQueueSize: 1, RunningRequestsSize: 1,
+	}
+	// ttft is already set, so the EOS path records only the TPOT sample.
+	predictedLatencyCtx.ttft = ttftMs
+	predictedLatencyCtx.responseChunkCount = 1
+	received := time.Now().Add(-time.Duration(ttftMs + decodeWindowMs) * time.Millisecond)
+	predictedLatencyCtx.requestReceivedTimestamp = received
+	for i := 1; i < chunks; i++ {
+		processTokenForLatencyPrediction(ctx, predictedLatencyCtx, time.Now())
+	}
+
+	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
+	queue := newRequestPriorityQueue()
+	queue.Add(request.Headers[reqcommon.RequestIDHeaderKey], 50.0)
+	router.runningRequestLists.Store(endpoint.GetMetadata().ID, queue)
+
+	response := &requestcontrol.Response{
+		EndOfStream: true,
+		Usage:       fwkrh.Usage{PromptTokens: 1000, CompletionTokens: completionTok},
+	}
+	router.ResponseBody(ctx, request, response, endpoint.GetMetadata())
+
+	e2eMs := float64(time.Since(received).Milliseconds())
+	wantPerToken := (e2eMs - ttftMs) / float64(completionTok-1)
+	timePerChunk := (e2eMs - ttftMs) / float64(chunks-1)
+
+	require.Len(t, mock.capturedTrainingEntries, 1, "EOS must record exactly the TPOT sample")
+	entry := mock.capturedTrainingEntries[0]
+	assert.InDelta(t, wantPerToken, entry.ActualTPOT, 2.0,
+		"label must be decode time per reported token")
+	assert.Greater(t, timePerChunk, entry.ActualTPOT*2,
+		"the chunk-based label is the defect this replaces")
+}
+
+// TestPredictedLatency_ResponseBody_TpotSkippedWithoutUsage pins the other
+// half of the fix: no usage block means no trustworthy denominator, and the
+// chunk count must not be used as a fallback.
+func TestPredictedLatency_ResponseBody_TpotSkippedWithoutUsage(t *testing.T) {
+	router := createTestRouter()
+	mock := new(mockPredictor)
+	router.latencypredictor = mock
+
+	ctx := context.Background()
+	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
+	request := createTestInferenceRequest("tpot-nousage", 100, 50)
+
+	predictedLatencyCtx := newPredictedLatencyContext(request)
+	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
+	predictedLatencyCtx.schedulingResult = createTestSchedulingResult(endpoint.GetMetadata())
+	predictedLatencyCtx.schedulingRequest = *request
+	predictedLatencyCtx.incomingModelName = testModelName
+	predictedLatencyCtx.lastSeenMetrics["default"] = &fwkdl.Metrics{
+		KVCacheUsagePercent: 0.5, WaitingQueueSize: 1, RunningRequestsSize: 1,
+	}
+	predictedLatencyCtx.ttft = 300.0
+	predictedLatencyCtx.responseChunkCount = 1
+	predictedLatencyCtx.requestReceivedTimestamp = time.Now().Add(-900 * time.Millisecond)
+	for i := 1; i < 10; i++ {
+		processTokenForLatencyPrediction(ctx, predictedLatencyCtx, time.Now())
+	}
+
+	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
+	queue := newRequestPriorityQueue()
+	queue.Add(request.Headers[reqcommon.RequestIDHeaderKey], 50.0)
+	router.runningRequestLists.Store(endpoint.GetMetadata().ID, queue)
+
+	router.ResponseBody(ctx, request, &requestcontrol.Response{EndOfStream: true}, endpoint.GetMetadata())
+
+	assert.Empty(t, mock.capturedTrainingEntries,
+		"a stream without a usage block must not train a chunk-based TPOT label")
+}
+
 func TestPredictedLatency_CheckPredictor_NilPod(t *testing.T) {
 	router := createTestRouter()
 	logger := logr.Discard()
@@ -863,7 +962,7 @@ func TestPredictedLatencyContext_Fields(t *testing.T) {
 	assert.NotNil(t, ctx.prefixCacheScoresForEndpoints)
 	assert.NotNil(t, ctx.predictionsForScheduling)
 	assert.Empty(t, ctx.predictedTPOTObservations)
-	assert.Zero(t, ctx.generatedTokenCount)
+	assert.Zero(t, ctx.responseChunkCount)
 	assert.Zero(t, ctx.ttft)
 	assert.Zero(t, ctx.avgTPOT)
 	assert.Nil(t, ctx.targetMetadata)

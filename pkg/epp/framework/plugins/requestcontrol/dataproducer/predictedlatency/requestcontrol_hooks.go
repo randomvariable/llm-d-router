@@ -176,9 +176,15 @@ func (pl *PredictedLatency) ResponseBody(ctx context.Context, request *fwksched.
 			}
 		}
 
-		if predictedLatencyCtx.ttft > 0 && predictedLatencyCtx.generatedTokenCount > 1 {
+		// The decode window belongs to the tokens the engine generated, not to
+		// the chunks that carried them. Same denominator as
+		// metrics.RecordRequestTPOT in pkg/epp/handlers/response.go: no usage
+		// block, or fewer than two tokens, means no trustworthy denominator, so
+		// record nothing rather than fall back to the chunk count - a
+		// chunk-based sample is the defect this replaces.
+		if predictedLatencyCtx.ttft > 0 && response.Usage.CompletionTokens > 1 {
 			e2eMs := float64(now.Sub(predictedLatencyCtx.requestReceivedTimestamp).Milliseconds())
-			predictedLatencyCtx.avgTPOT = (e2eMs - predictedLatencyCtx.ttft) / float64(predictedLatencyCtx.generatedTokenCount-1)
+			predictedLatencyCtx.avgTPOT = (e2eMs - predictedLatencyCtx.ttft) / float64(response.Usage.CompletionTokens-1)
 		}
 
 		if predictedLatencyCtx.avgTPOT > 0 {
@@ -259,7 +265,7 @@ func processFirstTokenForLatencyPrediction(
 	logger := log.FromContext(ctx)
 
 	predictedLatencyCtx.ttft = float64(now.Sub(predictedLatencyCtx.requestReceivedTimestamp).Milliseconds())
-	predictedLatencyCtx.generatedTokenCount = 1
+	predictedLatencyCtx.responseChunkCount = 1
 
 	if prefillTargetMetadata := predictedLatencyCtx.prefillTargetMetadata; prefillTargetMetadata != nil {
 		prefillMetrics, err := getLatestMetricsForProfile(predictedLatencyCtx, ExperimentalDefaultPrefillProfile)
@@ -316,9 +322,9 @@ func processTokenForLatencyPrediction(
 	logger := log.FromContext(ctx)
 
 	latencyMs := float64(now.Sub(predictedLatencyCtx.lastTokenTimestamp).Milliseconds())
-	predictedLatencyCtx.generatedTokenCount++
+	predictedLatencyCtx.responseChunkCount++
 
-	if predictedLatencyCtx.generatedTokenCount == 2 {
+	if predictedLatencyCtx.responseChunkCount == 2 {
 		logger.V(logutil.DEBUG).Info("First inter-token latency observed",
 			"actual_tpot_ms", latencyMs)
 	}

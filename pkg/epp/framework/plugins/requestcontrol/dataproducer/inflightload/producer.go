@@ -175,6 +175,13 @@ type addedTokensEntry struct {
 	producerName   string
 	fairnessID     string
 	priority       string
+	// endpointID is the unsplit tracker key ("namespace/name"); the label
+	// halves above cannot be rejoined reliably because splitNamespacedName maps
+	// a bare id to (id, ""). The tracker pointers let OnEvicted ask whether the
+	// counter it captured is still the registered one for that endpoint.
+	endpointID     string
+	requestTracker *concurrencyTracker
+	tokenTracker   *concurrencyTracker
 }
 
 var _ fwkplugin.EvictableStateData = (*addedTokensEntry)(nil)
@@ -190,6 +197,9 @@ func (e *addedTokensEntry) Clone() fwkplugin.StateData {
 	clone := &addedTokensEntry{
 		tokenCounter:   e.tokenCounter,
 		requestCounter: e.requestCounter,
+		endpointID:     e.endpointID,
+		requestTracker: e.requestTracker,
+		tokenTracker:   e.tokenTracker,
 		endpointName:   e.endpointName,
 		namespace:      e.namespace,
 		producerName:   e.producerName,
@@ -201,15 +211,39 @@ func (e *addedTokensEntry) Clone() fwkplugin.StateData {
 	return clone
 }
 
+// releaseTokens subtracts this entry's token contribution once. The tracker
+// decrement always lands on the captured instance, which may be orphaned after
+// an endpoint flap; the gauge is only touched while that instance is still the
+// registered one. Extract's EventDelete prunes the endpoint's gauge series with
+// DeletePartialMatch, so an orphaned release moving a label-keyed series would
+// recreate it below zero, where the tracker has a floor and the gauge does not.
+func (e *addedTokensEntry) releaseTokens() {
+	t := e.tokens.Swap(0)
+	if t == 0 {
+		return
+	}
+	decrementClamped(e.tokenCounter, t)
+	if !e.tokenTracker.isCurrent(e.endpointID, e.tokenCounter) {
+		return
+	}
+	inflightTokens.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Sub(float64(t))
+}
+
+// releaseRequests is the request counterpart of releaseTokens.
+func (e *addedTokensEntry) releaseRequests() {
+	if e.requests.Swap(0) == 0 {
+		return
+	}
+	decrementClamped(e.requestCounter, 1)
+	if !e.requestTracker.isCurrent(e.endpointID, e.requestCounter) {
+		return
+	}
+	inflightRequests.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Dec()
+}
+
 func (e *addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
-	if t := e.tokens.Swap(0); t != 0 {
-		decrementClamped(e.tokenCounter, t)
-		inflightTokens.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Sub(float64(t))
-	}
-	if e.requests.Swap(0) != 0 {
-		decrementClamped(e.requestCounter, 1)
-		inflightRequests.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Dec()
-	}
+	e.releaseTokens()
+	e.releaseRequests()
 }
 
 type inFlightLoadState struct {
@@ -478,6 +512,9 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		entry := &addedTokensEntry{
 			tokenCounter:   tokenCounter,
 			requestCounter: requestCounter,
+			endpointID:     eid,
+			requestTracker: p.requestTracker,
+			tokenTracker:   p.tokenTracker,
 			endpointName:   name,
 			namespace:      namespace,
 			producerName:   p.typedName.Name,
@@ -675,10 +712,7 @@ func (p *InFlightLoadProducer) releaseTokensEarly(endpoint fwksched.Endpoint, re
 
 	key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
 	if entry, err := fwkplugin.ReadPluginStateKey[*addedTokensEntry](p.PluginState, request.RequestID, key); err == nil {
-		if t := entry.tokens.Swap(0); t != 0 {
-			decrementClamped(entry.tokenCounter, t)
-			inflightTokens.WithLabelValues(entry.endpointName, entry.namespace, entry.producerName, entry.fairnessID, entry.priority).Sub(float64(t))
-		}
+		entry.releaseTokens()
 	}
 }
 
@@ -808,6 +842,20 @@ func (t *concurrencyTracker) snapshot() map[string]int64 {
 		result[endpointID] = counter.Load()
 	}
 	return result
+}
+
+// isCurrent reports whether counter is still the instance registered for
+// endpointID. A deleted endpoint's key is absent, and a recreated one holds a
+// fresh instance from add, so both answer false; an entry whose tracker or
+// counter is nil can never move a gauge. This is the same same-pointer
+// discipline Extract applies when dropping stale deletes.
+func (t *concurrencyTracker) isCurrent(endpointID string, counter *atomic.Int64) bool {
+	if t == nil || counter == nil {
+		return false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.counts[endpointID] == counter
 }
 
 func (t *concurrencyTracker) inc(endpointID string) *atomic.Int64 {
