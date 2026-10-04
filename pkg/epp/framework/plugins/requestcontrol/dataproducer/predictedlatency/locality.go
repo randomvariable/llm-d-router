@@ -108,7 +108,11 @@ func (pl *PredictedLatency) recordCacheLocality(
 	if debug := logger.V(logutil.DEBUG); debug.Enabled() {
 		debug.Info("Recorded cache locality observation",
 			"pod", endpointName, "predicted", predicted, "actual", actual,
-			"promptTokens", prompt, "cachedTokens", cached)
+			"promptTokens", prompt, "cachedTokens", cached,
+			// completionTokens lets an offline audit derive per-token decode rate
+			// and the TPOT training denominator from the same record as the
+			// locality pair, instead of re-parsing the stream.
+			"completionTokens", usage.CompletionTokens)
 	}
 }
 
