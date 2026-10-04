@@ -575,6 +575,124 @@ func TestInFlightLoadProducer_CrashWithHighLoadDoesNotUnderflow(t *testing.T) {
 	require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
 }
 
+// TestInFlightLoadProducer_CrashWithHighLoadDoesNotUnderflowGauges is the gauge
+// counterpart of TestInFlightLoadProducer_CrashWithHighLoadDoesNotUnderflow,
+// which asserts only the in-memory trackers. The trackers clamp at zero, but
+// OnEvicted also decremented the Prometheus series by label, so a late release
+// from a crashed endpoint recreated the pruned series below zero (observed as
+// llm_d_epp_inflight_requests == -1 on a restarted rank). The invariant under
+// test is that the exported gauge always equals the tracker.
+func TestInFlightLoadProducer_CrashWithHighLoadDoesNotUnderflowGauges(t *testing.T) {
+	const (
+		inFlight = 8
+		inputTok = 4
+	)
+
+	tests := []struct {
+		name                     string
+		addEstimatedOutputTokens bool
+	}{
+		{name: "EndOfStream eviction", addEstimatedOutputTokens: true},
+		{name: "StartOfStream early token release", addEstimatedOutputTokens: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			producer := newTestProducer(t)
+			producer.addEstimatedOutputTokens = tc.addEstimatedOutputTokens
+			// The gauges are package-level vectors, so each subtest needs its own
+			// endpoint labels or its series would be shared with the other subtest.
+			endpointNm := fmt.Sprintf("crash-gauge-%v", tc.addEstimatedOutputTokens)
+			ctx := context.Background()
+			endpointID := fullEndpointName(endpointNm)
+
+			requestsGauge := func() float64 {
+				return promtestutil.ToFloat64(inflightRequests.WithLabelValues(
+					endpointNm, "default", "inflight-load-producer", "", "0"))
+			}
+			tokensGauge := func() float64 {
+				return promtestutil.ToFloat64(inflightTokens.WithLabelValues(
+					endpointNm, "default", "inflight-load-producer", "", "0"))
+			}
+			// Expected tokens per admitted request, from the same tracker the
+			// scorer reads, so the expectation is not hand-computed.
+			perRequestTokens := func() int64 {
+				if tc.addEstimatedOutputTokens {
+					return inputTok + UnknownOutputTokens
+				}
+				return inputTok
+			}
+
+			seriesBefore := promtestutil.CollectAndCount(inflightRequests)
+
+			epCrashed := newStubSchedulingEndpoint(endpointNm)
+			require.NoError(t, producer.Extract(ctx, datalayer.EndpointEvent{
+				Type: datalayer.EventAddOrUpdate, Endpoint: epCrashed,
+			}))
+
+			reqs := make([]*fwksched.InferenceRequest, inFlight)
+			results := make([]*fwksched.SchedulingResult, inFlight)
+			for i := range inFlight {
+				reqs[i] = makeTokenRequest(fmt.Sprintf("crash-gauge-%d-%v", i, tc.addEstimatedOutputTokens), inputTok)
+				results[i] = makeSchedulingResult(endpointNm)
+				_ = producer.PreRequest(ctx, reqs[i], results[i])
+			}
+			require.Equal(t, float64(inFlight), requestsGauge(), "gauge must follow admission")
+			require.Equal(t, float64(inFlight)*float64(perRequestTokens()), tokensGauge())
+			require.Equal(t, seriesBefore+1, promtestutil.CollectAndCount(inflightRequests),
+				"one series per endpoint")
+
+			// The endpoint is deleted: its series are pruned along with the tracker.
+			require.NoError(t, producer.Extract(ctx, datalayer.EndpointEvent{
+				Type: datalayer.EventDelete, Endpoint: epCrashed,
+			}))
+			require.Equal(t, seriesBefore, promtestutil.CollectAndCount(inflightRequests),
+				"EventDelete must prune the endpoint's series")
+			require.Equal(t, int64(0), producer.GetRequests(endpointID))
+
+			// It rejoins under the same name and takes one live request.
+			epNew := newStubSchedulingEndpoint(endpointNm)
+			require.NoError(t, producer.Extract(ctx, datalayer.EndpointEvent{
+				Type: datalayer.EventAddOrUpdate, Endpoint: epNew,
+			}))
+			reqLive := makeTokenRequest(fmt.Sprintf("crash-gauge-live-%v", tc.addEstimatedOutputTokens), inputTok)
+			resLive := makeSchedulingResult(endpointNm)
+			_ = producer.PreRequest(ctx, reqLive, resLive)
+			require.Equal(t, int64(1), producer.GetRequests(endpointID))
+			require.Equal(t, float64(1), requestsGauge())
+			require.Equal(t, float64(perRequestTokens()), tokensGauge())
+
+			// The crashed requests drain late. Their releases must not move the
+			// live series, which would put it at 1-8 = -7 without the guard.
+			for i := range inFlight {
+				reqs[i].SchedulingResult = results[i]
+				if !tc.addEstimatedOutputTokens {
+					producer.ResponseBody(ctx, reqs[i], &requestcontrol.Response{StartOfStream: true}, nil)
+				}
+				producer.ResponseBody(ctx, reqs[i], &requestcontrol.Response{EndOfStream: true}, nil)
+
+				require.Equal(t, float64(producer.GetRequests(endpointID)), requestsGauge(),
+					"gauge must equal the tracker after each late release")
+				require.Equal(t, float64(producer.GetTokens(endpointID)), tokensGauge(),
+					"gauge must equal the tracker after each late release")
+				require.GreaterOrEqual(t, requestsGauge(), 0.0)
+				require.GreaterOrEqual(t, tokensGauge(), 0.0)
+			}
+
+			// The live request completes and both settle at zero, still matching.
+			reqLive.SchedulingResult = resLive
+			if !tc.addEstimatedOutputTokens {
+				producer.ResponseBody(ctx, reqLive, &requestcontrol.Response{StartOfStream: true}, nil)
+			}
+			producer.ResponseBody(ctx, reqLive, &requestcontrol.Response{EndOfStream: true}, nil)
+			require.Equal(t, float64(0), requestsGauge())
+			require.Equal(t, float64(0), tokensGauge())
+			require.Equal(t, int64(0), producer.GetRequests(endpointID))
+			require.Equal(t, int64(0), producer.GetTokens(endpointID))
+		})
+	}
+}
+
 // TestInFlightLoadProducer_StaleDeleteIgnored verifies the registeredEndpoints
 // guard: a delete carrying a different Endpoint object than the one currently
 // registered (an out-of-order delete for an already-replaced pod) must NOT drop
