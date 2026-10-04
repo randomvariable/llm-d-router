@@ -46,6 +46,7 @@ func TestCollectorsIncludesAllMetrics(t *testing.T) {
 	}{
 		{"Admissions", Admissions},
 		{"Evictions", Evictions},
+		{"CapacityEvictions", CapacityEvictions},
 		{"LookupRequests", LookupRequests},
 		{"LookupHits", LookupHits},
 		{"LookupLatency", LookupLatency},

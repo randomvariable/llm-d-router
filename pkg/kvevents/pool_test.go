@@ -38,6 +38,29 @@ func newTestPool(t *testing.T, blockSize int) (
 	return pool, idx, tp
 }
 
+// newTestPoolWithPodCacheSize mirrors newTestPool but pins the index's
+// per-key entry cap, which is what let 13 group announcements evict other
+// pods' holders in production.
+func newTestPoolWithPodCacheSize(t *testing.T, blockSize, podCacheSize int) (
+	*Pool, kvblock.Index, kvblock.TokenProcessor,
+) {
+	t.Helper()
+
+	idx, err := kvblock.NewInMemoryIndex(&kvblock.InMemoryIndexConfig{
+		Size:         kvblock.DefaultInMemoryIndexConfig().Size,
+		PodCacheSize: podCacheSize,
+	})
+	require.NoError(t, err)
+
+	tp, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{
+		BlockSizeTokens: blockSize,
+		HashSeed:        "test",
+	})
+	require.NoError(t, err)
+
+	return NewPool(DefaultConfig(), idx, tp, nil), idx, tp
+}
+
 type recordingIndex struct {
 	kvblock.Index
 	getRequestKeyCalls int
@@ -842,7 +865,12 @@ func TestHMAGroupKindFilter(t *testing.T) {
 			for _, key := range canonicalKeys {
 				if tt.allowed {
 					require.Len(t, result[key], 1)
-					assert.Equal(t, kvblock.GroupID(groupIdx), result[key][0].GroupIdx)
+					if storesAsPodTierEntry(tt.kind) {
+						assert.False(t, result[key][0].HasGroup,
+							"full-attention groups index as one (pod, tier) holder")
+					} else {
+						assert.Equal(t, kvblock.GroupID(groupIdx), result[key][0].GroupIdx)
+					}
 				} else {
 					assert.Empty(t, result[key])
 				}
@@ -900,8 +928,190 @@ func TestHMAGroupFilterIgnoresRejectedGroupRemoval(t *testing.T) {
 	assert.Zero(t, recording.evictCalls)
 }
 
-// TestHMAGroupLevelEviction_BlockRemoved verifies that a BlockRemoved event with GroupIdx
-// performs a group-level eviction, leaving other groups intact.
+// hmaFullAttentionGroups and hmaFirstGroupIdx mirror the deployed
+// qwen38-flash-next engine: 13 of its 50 KV cache groups are full attention
+// (12 layers plus the MTP draft layer), and vLLM announces every stored block
+// once per group with the same block and parent hashes.
+const (
+	hmaFullAttentionGroups = 13
+	hmaFirstGroupIdx       = 37
+)
+
+// storeFullAttentionGroups announces one block from pod through all
+// hmaFullAttentionGroups full-attention groups.
+func storeFullAttentionGroups(pool *Pool, ctx context.Context, pod string,
+	engineKeys []uint64, tokens []uint32,
+) {
+	for g := range hmaFullAttentionGroups {
+		groupIdx := hmaFirstGroupIdx + g
+		pool.processEventBatch(ctx, &EventBatch{
+			Events: []GenericEvent{
+				&BlockStoredEvent{
+					BlockHashes:     engineKeys,
+					Tokens:          tokens,
+					GroupIdx:        &groupIdx,
+					KVCacheSpecKind: KVCacheSpecKindFullAttention,
+					BlockSize:       16,
+				},
+			},
+		}, pod, "test-model")
+	}
+}
+
+// TestPool_HMAFullAttentionGroupsSharePodTierHolder is the regression for the
+// deployed locality defect: with podCacheSize 3 and 13 announcements per block,
+// the last storing pod used to be the only matchable holder. The engine serves
+// the block only if all its groups hold it, so the 13 announcements are one
+// holder and all three pods must remain matchable.
+func TestPool_HMAFullAttentionGroupsSharePodTierHolder(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPoolWithPodCacheSize(t, 16, 3)
+
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 900)
+	pods := []string{"pod-a", "pod-b", "pod-c"}
+	for _, pod := range pods {
+		storeFullAttentionGroups(pool, ctx, pod, engineKeys, tokens)
+	}
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	result, err := idx.Lookup(ctx, canonicalKeys, nil)
+	require.NoError(t, err)
+	for _, ck := range canonicalKeys {
+		require.Len(t, result[ck], len(pods),
+			"13 group announcements per pod must collapse to one holder per pod")
+		for _, entry := range result[ck] {
+			assert.False(t, entry.HasGroup)
+		}
+		got := make([]string, 0, len(result[ck]))
+		for _, entry := range result[ck] {
+			got = append(got, entry.PodIdentifier)
+		}
+		assert.ElementsMatch(t, pods, got)
+	}
+}
+
+// TestPool_HMAAnyGroupRemovalEvictsPodTierHolder pins the AND semantics: the
+// engine cannot serve a block that any one of its groups has released, so one
+// group's removal drops the whole (pod, tier) holder while other pods remain.
+func TestPool_HMAAnyGroupRemovalEvictsPodTierHolder(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPoolWithPodCacheSize(t, 16, 3)
+
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 900)
+	for _, pod := range []string{"pod-a", "pod-b", "pod-c"} {
+		storeFullAttentionGroups(pool, ctx, pod, engineKeys, tokens)
+	}
+
+	releasedGroup := hmaFirstGroupIdx
+	pool.processEventBatch(ctx, &EventBatch{
+		Events: []GenericEvent{
+			&BlockRemovedEvent{BlockHashes: engineKeys, GroupIdx: &releasedGroup},
+		},
+	}, "pod-a", "test-model")
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	result, err := idx.Lookup(ctx, canonicalKeys, nil)
+	require.NoError(t, err)
+	for _, ck := range canonicalKeys {
+		got := make([]string, 0, len(result[ck]))
+		for _, entry := range result[ck] {
+			got = append(got, entry.PodIdentifier)
+		}
+		assert.NotContains(t, got, "pod-a", "one released group must drop the holder")
+		assert.Len(t, got, 2, "other pods keep the block")
+	}
+}
+
+// TestPool_HMAGroupReferenceCountSurvivesDuplicates verifies the dedup scope
+// stayed group-scoped while the holder collapsed: two announcements from the
+// same group need two removes before the holder is dropped, which is what keeps
+// chunk-mode offload from evicting a block the engine still holds.
+func TestPool_HMAGroupReferenceCountSurvivesDuplicates(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPoolWithPodCacheSize(t, 16, 3)
+
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 900)
+	groupIdx := hmaFirstGroupIdx
+	store := func() {
+		pool.processEventBatch(ctx, &EventBatch{
+			Events: []GenericEvent{
+				&BlockStoredEvent{
+					BlockHashes: engineKeys, Tokens: tokens, GroupIdx: &groupIdx,
+					KVCacheSpecKind: KVCacheSpecKindFullAttention, BlockSize: 16,
+				},
+			},
+		}, "pod-a", "test-model")
+	}
+	remove := func() {
+		pool.processEventBatch(ctx, &EventBatch{
+			Events: []GenericEvent{
+				&BlockRemovedEvent{BlockHashes: engineKeys, GroupIdx: &groupIdx},
+			},
+		}, "pod-a", "test-model")
+	}
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+
+	store()
+	store()
+	remove() // 2 -> 1: forwarded only at zero, so the holder stays
+	result, err := idx.Lookup(ctx, canonicalKeys, nil)
+	require.NoError(t, err)
+	for _, ck := range canonicalKeys {
+		require.Len(t, result[ck], 1)
+		assert.Equal(t, "pod-a", result[ck][0].PodIdentifier)
+	}
+
+	remove() // 1 -> 0: the group's last reference is gone
+	result, err = idx.Lookup(ctx, canonicalKeys, nil)
+	require.NoError(t, err)
+	for _, ck := range canonicalKeys {
+		assert.Empty(t, result[ck])
+	}
+}
+
+// TestPool_UnresolvedParentBlockStoredCountsSkipped makes the parent-chain drop
+// observable: it silently broke prefix chains whenever the index evicted a
+// parent key.
+func TestPool_UnresolvedParentBlockStoredCountsSkipped(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, _ := newTestPool(t, 16)
+
+	counter := func() float64 {
+		return counterValue(t, metrics.KVEventStoresSkipped.
+			WithLabelValues(string(KVCacheSpecKindFullAttention), "unresolved_parent"))
+	}
+	before := counter()
+
+	groupIdx := hmaFirstGroupIdx
+	pool.processEventBatch(ctx, &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes:     makeEngineKeys(4, 950), // parent 949 was never announced
+				Tokens:          makeTokens(64),
+				ParentHash:      949,
+				GroupIdx:        &groupIdx,
+				KVCacheSpecKind: KVCacheSpecKindFullAttention,
+				BlockSize:       16,
+			},
+		},
+	}, "pod-hma", "test-model")
+
+	assert.Equal(t, before+1, counter(), "unresolved parent must be counted, not silently dropped")
+	_, err := idx.GetRequestKey(ctx, kvblock.BlockHash(950))
+	assert.Error(t, err, "nothing may be indexed under an unresolved parent")
+}
+
+// TestHMAGroupLevelEviction_BlockRemoved verifies that releasing a group's last
+// reference evicts the whole holder for a full-attention block, because the
+// engine could no longer serve it. Under the old per-group identity this
+// asserted that the surviving group stayed matchable, which over-predicted.
 func TestHMAGroupLevelEviction_BlockRemoved(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, idx, tp := newTestPool(t, 16)
@@ -909,56 +1119,41 @@ func TestHMAGroupLevelEviction_BlockRemoved(t *testing.T) {
 	tokens := makeTokens(64)
 	engineKeys := makeEngineKeys(4, 850)
 
-	// Store two groups for the same block (simulates two BlockStored events)
-	for _, g := range []int{0, 1} {
-		gIdx := g
-		batch := &EventBatch{
+	for _, g := range []int{hmaFirstGroupIdx, hmaFirstGroupIdx + 1} {
+		groupIdx := g
+		pool.processEventBatch(ctx, &EventBatch{
 			Events: []GenericEvent{
 				&BlockStoredEvent{
-					BlockHashes:     engineKeys,
-					Tokens:          tokens,
-					ParentHash:      0,
-					GroupIdx:        &gIdx,
-					KVCacheSpecKind: KVCacheSpecKindFullAttention,
-					BlockSize:       16,
+					BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0,
+					GroupIdx: &groupIdx, KVCacheSpecKind: KVCacheSpecKindFullAttention, BlockSize: 16,
 				},
 			},
-		}
-		pool.processEventBatch(ctx, batch, "pod-hma", "test-model")
+		}, "pod-hma", "test-model")
 	}
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
 	require.NoError(t, err)
 
-	// Verify both groups present
 	result, err := idx.Lookup(ctx, canonicalKeys, nil)
 	require.NoError(t, err)
 	for _, ck := range canonicalKeys {
 		entries := result[ck]
-		require.Len(t, entries, 2)
-		assert.ElementsMatch(t, []kvblock.GroupID{0, 1}, []kvblock.GroupID{entries[0].GroupIdx, entries[1].GroupIdx})
+		require.Len(t, entries, 1, "both group announcements share one (pod, tier) holder")
+		assert.False(t, entries[0].HasGroup)
 	}
 
-	// Evict group 0 only
-	evictGroupIdx := 0
-	removeBatch := &EventBatch{
+	evictGroupIdx := hmaFirstGroupIdx
+	pool.processEventBatch(ctx, &EventBatch{
 		Events: []GenericEvent{
-			&BlockRemovedEvent{
-				BlockHashes: engineKeys,
-				GroupIdx:    &evictGroupIdx,
-			},
+			&BlockRemovedEvent{BlockHashes: engineKeys, GroupIdx: &evictGroupIdx},
 		},
-	}
-	pool.processEventBatch(ctx, removeBatch, "pod-hma", "test-model")
+	}, "pod-hma", "test-model")
 
-	// Group 1 should remain; group 0 should be gone
 	result, err = idx.Lookup(ctx, canonicalKeys, nil)
 	require.NoError(t, err)
 	for _, ck := range canonicalKeys {
-		entries := result[ck]
-		require.Len(t, entries, 1, "pod should still be present after partial eviction")
-		assert.True(t, entries[0].HasGroup)
-		assert.Equal(t, kvblock.GroupID(1), entries[0].GroupIdx)
+		assert.Empty(t, result[ck],
+			"one released group means the engine cannot serve the block")
 	}
 }
 

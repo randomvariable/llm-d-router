@@ -549,20 +549,22 @@ These metrics belong to the precise-prefix-cache pipeline. Set
 configs (e.g. [`deploy/config/sim-epp-kvcache-config.yaml`](../deploy/config/sim-epp-kvcache-config.yaml))
 leave it off, so these series are absent until an operator opts in. The embedded llm-d-kv-cache
 index and KV-event pool register these metrics in the router pod's EPP registry, so they are
-available from the existing EPP `/metrics` endpoint. Index metrics are unlabeled. KV-event metrics
-use the labels shown below.
+available from the existing EPP `/metrics` endpoint. Index metrics are unlabeled
+except `llm_d_epp_kv_cache_index_capacity_evictions_total`, which carries `map`.
+KV-event metrics use the labels shown below.
 
 | Full metric name | Type | Labels | Notes |
 |---|---|---|---|
 | `llm_d_epp_kv_cache_index_admissions_total` | Counter | - | Blocks admitted to the index. |
-| `llm_d_epp_kv_cache_index_evictions_total` | Counter | - | Blocks evicted from the index. |
+| `llm_d_epp_kv_cache_index_evictions_total` | Counter | - | Blocks evicted from the index by a wire removal. |
+| `llm_d_epp_kv_cache_index_capacity_evictions_total` | Counter | `map` (`request_keys`, `engine_to_request_keys`) | Entries the index LRUs dropped for capacity. A rate here while the index is at `size` means the index has fallen behind what the engines still hold, which shows up as predicted prefix misses. |
 | `llm_d_epp_kv_cache_index_lookup_requests_total` | Counter | - | Index lookups performed. |
 | `llm_d_epp_kv_cache_index_lookup_hits_total` | Counter | - | Contiguous prefix blocks matched by the best pod per lookup. |
 | `llm_d_epp_kv_cache_index_max_pod_hit_count_total` | Counter | - | Longest contiguous per-pod prefix chain observed per lookup. |
 | `llm_d_epp_kv_cache_index_lookup_latency_seconds` | Histogram | - | Index lookup latency. |
 | `llm_d_epp_kv_cache_events_dedup_removed_hashes_suppressed_total` | Counter | - | Deduplicated removal hashes suppressed. |
 | `llm_d_epp_kv_cache_events_dedup_removed_hashes_forwarded_total` | Counter | - | Deduplicated removal hashes forwarded. |
-| `llm_d_epp_kv_cache_events_stores_skipped_total` | Counter | `cache_kind`, `reason` | KV store events skipped before prefix indexing. |
+| `llm_d_epp_kv_cache_events_stores_skipped_total` | Counter | `cache_kind`, `reason` (`unsupported_cache_kind`, `invalid_block_size`, `non_dense_block_span`, `unresolved_parent`) | KV store events skipped before prefix indexing. |
 | `llm_d_epp_kv_cache_events_removals_skipped_total` | Counter | `cache_kind`, `reason` | KV removal events skipped before prefix indexing. |
 | `llm_d_epp_kv_cache_events_active_subscribers` | Gauge | - | ZMQ subscribers currently managed. |
 | `llm_d_epp_kv_cache_events_subscriber_reconnections_total` | Counter | `pod_identifier` | ZMQ subscriber reconnection attempts. |

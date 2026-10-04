@@ -26,11 +26,16 @@ engines.
 - **Worker pool.** `Pool` fans messages out to workers keyed by a sharding key
   so events for the same block are processed in order, then applies them to the
   index.
-- **Reference-count dedup.** A dedup filter reference-counts block hashes so a
-  removal is forwarded to the index only once no remaining announcement
-  references the block, preventing premature eviction of blocks that multiple
-  engines (or HMA groups) still hold. Suppressed and forwarded removals are
-  counted in the [metrics](../kvcache/metrics/README.md).
+- **Reference-count dedup.** A dedup filter reference-counts block hashes per
+  `(pod, tier, group)` scope, so a removal is forwarded to the index only once
+  no announcement in that scope still references the block. This is what makes
+  an evicted block genuinely gone: for `full_attention`, whose groups share one
+  index holder, the first group to release its last reference removes the
+  holder, matching the engine's rule that a block is servable only while all of
+  its groups hold it. Suppressed and forwarded removals, and stores skipped
+  before indexing (`unsupported_cache_kind`, `invalid_block_size`,
+  `non_dense_block_span`, `unresolved_parent`), are counted in the
+  [metrics](../kvcache/metrics/README.md).
 
 ## Key Types
 

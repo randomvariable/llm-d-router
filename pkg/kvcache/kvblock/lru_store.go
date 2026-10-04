@@ -65,10 +65,14 @@ func (s *lruStore) Promote(keys []BlockHash) {
 	}
 }
 
-func (s *lruStore) Add(key BlockHash, value *PodCache) {
+// Add inserts or replaces key, reporting whether the LRU dropped another
+// entry to make room. Remove is an explicit eviction and is deliberately not
+// reported here; only capacity drops, which have no matching engine event,
+// carry that signal.
+func (s *lruStore) Add(key BlockHash, value *PodCache) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lru.Add(key, value)
+	return s.lru.Add(key, value)
 }
 
 // ContainsOrAdd reports whether key is present and, when it is not, adds
