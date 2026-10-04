@@ -375,7 +375,10 @@ type predictedLatencyCtx struct {
 	lastSeenMetrics           map[string]*fwkdl.Metrics
 	lastTokenTimestamp        time.Time
 	requestReceivedTimestamp  time.Time
-	generatedTokenCount       int
+	// responseChunkCount counts streamed response chunks, not tokens. Under
+	// speculative decoding one chunk carries several tokens, so it is never a
+	// valid TPOT denominator; response.Usage.CompletionTokens is.
+	responseChunkCount        int
 	incomingModelName         string
 	ttft                      float64
 	predictedTTFT             float64

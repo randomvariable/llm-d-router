@@ -13,7 +13,10 @@ DataProducer, PreRequest, ResponseHeader, ResponseBody, ProducerPlugin, Consumer
 - Bulk predictions during `Produce` (writes `LatencyPredictionInfo` to endpoint attributes)
 - SLO headroom calculation per endpoint: `headroom = SLO - predicted_latency` (used by downstream scorer and admission plugins)
 - TTFT training data collection on first token / EOS
-- TPOT training data collection at EOS (streaming mode)
+- TPOT training data collection at EOS (streaming mode), labelled decode time per
+  reported output token (`usage.completion_tokens - 1`), not per streamed chunk:
+  speculative decoding packs several tokens into one chunk. A stream without a
+  usage block records no TPOT sample at all.
 - Per-endpoint running request queue tracking (TPOT SLO priority queue)
 - Prefix cache score forwarding from `PrefixCacheMatchInfo` attributes
 - Multimodal encoder-cache size forwarding from `EncoderCacheMatchInfo` attributes
