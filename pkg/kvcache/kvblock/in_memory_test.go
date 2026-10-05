@@ -26,8 +26,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
-	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 	. "github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 )
 
 // createInMemoryIndexForTesting creates a new InMemoryIndex for testing.
@@ -270,7 +270,6 @@ func TestAddWithNilEngineKeys(t *testing.T) {
 	_, err = index.GetRequestKey(ctx, requestKey)
 	assert.Error(t, err, "GetRequestKey should fail since no engineKey mapping was created")
 }
-
 
 // TestInMemoryIndexCapacityEvictionsCountLRUDropsOnly makes silent index
 // starvation observable: entries the LRUs drop on capacity have no matching

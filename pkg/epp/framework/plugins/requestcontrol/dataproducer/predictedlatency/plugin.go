@@ -368,13 +368,13 @@ func (pl *PredictedLatency) getOrMakePredictedLatencyContextForRequest(request *
 
 // predictedLatencyCtx holds per-request state for latency prediction and training.
 type predictedLatencyCtx struct {
-	schedulingRequest         fwksched.InferenceRequest
-	targetMetadata            *fwkdl.EndpointMetadata
-	prefillTargetMetadata     *fwkdl.EndpointMetadata
-	schedulingResult          *fwksched.SchedulingResult
-	lastSeenMetrics           map[string]*fwkdl.Metrics
-	lastTokenTimestamp        time.Time
-	requestReceivedTimestamp  time.Time
+	schedulingRequest        fwksched.InferenceRequest
+	targetMetadata           *fwkdl.EndpointMetadata
+	prefillTargetMetadata    *fwkdl.EndpointMetadata
+	schedulingResult         *fwksched.SchedulingResult
+	lastSeenMetrics          map[string]*fwkdl.Metrics
+	lastTokenTimestamp       time.Time
+	requestReceivedTimestamp time.Time
 	// responseChunkCount counts streamed response chunks, not tokens. Under
 	// speculative decoding one chunk carries several tokens, so it is never a
 	// valid TPOT denominator; response.Usage.CompletionTokens is.

@@ -854,7 +854,7 @@ func TestPredictedLatency_ResponseBody_TpotUsesCompletionTokens(t *testing.T) {
 	// ttft is already set, so the EOS path records only the TPOT sample.
 	predictedLatencyCtx.ttft = ttftMs
 	predictedLatencyCtx.responseChunkCount = 1
-	received := time.Now().Add(-time.Duration(ttftMs + decodeWindowMs) * time.Millisecond)
+	received := time.Now().Add(-time.Duration(ttftMs+decodeWindowMs) * time.Millisecond)
 	predictedLatencyCtx.requestReceivedTimestamp = received
 	for i := 1; i < chunks; i++ {
 		processTokenForLatencyPrediction(ctx, predictedLatencyCtx, time.Now())
