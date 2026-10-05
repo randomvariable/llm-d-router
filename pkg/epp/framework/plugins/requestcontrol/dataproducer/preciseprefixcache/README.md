@@ -46,6 +46,17 @@ so with a shared head sampler always-on event spans crowd request traces out of
 the exported volume. The EPP `--tracing` flag gates tracing as a whole, so this
 field has no effect while that is off.
 
+Set `kvEventsConfig.ignoredKVCacheGroups` to the KV cache group index of a
+speculative-decoding draft model (for example `[49]` for a 12-layer
+full-attention model plus one MTP layer). vLLM announces the draft group as
+just another `full_attention` group and evicts its blocks independently of the
+target model's groups while still serving the prefix. Without this setting each
+such eviction removes the endpoint from the index for a block the engine still
+holds, starting with the oldest blocks of the longest sessions. vLLM logs
+`no KV cache group could be identified as the draft model's` when it cannot tell
+the groups apart; the group index follows the model's layer layout, so revisit
+it when the model changes.
+
 See [llm-d-kv-cache/docs/configuration.md](https://github.com/llm-d/llm-d-kv-cache/blob/main/docs/configuration.md)
 for nested parameter details.
 

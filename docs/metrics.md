@@ -564,8 +564,8 @@ KV-event metrics use the labels shown below.
 | `llm_d_epp_kv_cache_index_lookup_latency_seconds` | Histogram | - | Index lookup latency. |
 | `llm_d_epp_kv_cache_events_dedup_removed_hashes_suppressed_total` | Counter | - | Deduplicated removal hashes suppressed. |
 | `llm_d_epp_kv_cache_events_dedup_removed_hashes_forwarded_total` | Counter | - | Deduplicated removal hashes forwarded. |
-| `llm_d_epp_kv_cache_events_stores_skipped_total` | Counter | `cache_kind`, `reason` (`unsupported_cache_kind`, `invalid_block_size`, `non_dense_block_span`, `unresolved_parent`) | KV store events skipped before prefix indexing. |
-| `llm_d_epp_kv_cache_events_removals_skipped_total` | Counter | `cache_kind`, `reason` | KV removal events skipped before prefix indexing. |
+| `llm_d_epp_kv_cache_events_stores_skipped_total` | Counter | `cache_kind`, `reason` (`unsupported_cache_kind`, `invalid_block_size`, `non_dense_block_span`, `unresolved_parent`, `ignored_group`) | KV store events skipped before prefix indexing. |
+| `llm_d_epp_kv_cache_events_removals_skipped_total` | Counter | `cache_kind`, `reason` (`unsupported_cache_kind`, `unknown_group`, `ignored_group`) | KV removal events skipped before prefix indexing. |
 | `llm_d_epp_kv_cache_events_active_subscribers` | Gauge | - | ZMQ subscribers currently managed. |
 | `llm_d_epp_kv_cache_events_subscriber_reconnections_total` | Counter | `pod_identifier` | ZMQ subscriber reconnection attempts. |
 | `llm_d_epp_kv_cache_events_messages_received_total` | Counter | `pod_identifier` | Messages received from ZMQ subscribers. |

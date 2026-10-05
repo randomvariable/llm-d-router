@@ -45,6 +45,15 @@ func newTestPoolWithPodCacheSize(t *testing.T, blockSize, podCacheSize int) (
 	*Pool, kvblock.Index, kvblock.TokenProcessor,
 ) {
 	t.Helper()
+	return newTestPoolWithConfig(t, blockSize, podCacheSize, DefaultConfig())
+}
+
+// newTestPoolWithConfig is newTestPoolWithPodCacheSize with an explicit pool
+// configuration.
+func newTestPoolWithConfig(t *testing.T, blockSize, podCacheSize int, cfg *Config) (
+	*Pool, kvblock.Index, kvblock.TokenProcessor,
+) {
+	t.Helper()
 
 	idx, err := kvblock.NewInMemoryIndex(&kvblock.InMemoryIndexConfig{
 		Size:         kvblock.DefaultInMemoryIndexConfig().Size,
@@ -58,7 +67,7 @@ func newTestPoolWithPodCacheSize(t *testing.T, blockSize, podCacheSize int) (
 	})
 	require.NoError(t, err)
 
-	return NewPool(DefaultConfig(), idx, tp, nil), idx, tp
+	return NewPool(cfg, idx, tp, nil), idx, tp
 }
 
 type recordingIndex struct {
@@ -1024,6 +1033,59 @@ func TestPool_HMAAnyGroupRemovalEvictsPodTierHolder(t *testing.T) {
 		assert.NotContains(t, got, "pod-a", "one released group must drop the holder")
 		assert.Len(t, got, 2, "other pods keep the block")
 	}
+}
+
+// TestPool_IgnoredDraftGroupRemovalKeepsHolder reproduces the live engine: a
+// qwen38-flash-next leader announces each block in 13 full-attention groups,
+// the last of which (49) belongs to the MTP draft layer. vLLM does not mark
+// that group and evicts its copies on its own schedule while still serving the
+// prefix from the target groups. A 20-minute event capture showed 137 sequence
+// extensions through parents whose only missing group was 49. Without the
+// ignore list such a removal dropped the holder, so long sessions lost their
+// first block from the index and matched nothing while the engine served
+// them from cache.
+func TestPool_IgnoredDraftGroupRemovalKeepsHolder(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	draftGroup := hmaFirstGroupIdx + hmaFullAttentionGroups - 1
+	targetGroup := hmaFirstGroupIdx + 3
+
+	cfg := DefaultConfig()
+	cfg.IgnoredKVCacheGroups = []int{draftGroup}
+	pool, idx, tp := newTestPoolWithConfig(t, 16, 3, cfg)
+
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 900)
+	storeFullAttentionGroups(pool, ctx, "pod-a", engineKeys, tokens)
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	holds := func() bool {
+		result, err := idx.Lookup(ctx, canonicalKeys, nil)
+		require.NoError(t, err)
+		for _, ck := range canonicalKeys {
+			found := false
+			for _, entry := range result[ck] {
+				if entry.PodIdentifier == "pod-a" {
+					found = true
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	remove := func(group int) {
+		pool.processEventBatch(ctx, &EventBatch{
+			Events: []GenericEvent{&BlockRemovedEvent{BlockHashes: engineKeys, GroupIdx: &group}},
+		}, "pod-a", "test-model")
+	}
+
+	remove(draftGroup)
+	assert.True(t, holds(), "a draft-group removal must not drop a block the target groups still hold")
+
+	remove(targetGroup)
+	assert.False(t, holds(), "a target-group removal still drops the holder")
 }
 
 // TestPool_HMAGroupReferenceCountSurvivesDuplicates verifies the dedup scope

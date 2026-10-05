@@ -32,10 +32,12 @@ engines.
   an evicted block genuinely gone: for `full_attention`, whose groups share one
   index holder, the first group to release its last reference removes the
   holder, matching the engine's rule that a block is servable only while all of
-  its groups hold it. Suppressed and forwarded removals, and stores skipped
-  before indexing (`unsupported_cache_kind`, `invalid_block_size`,
-  `non_dense_block_span`, `unresolved_parent`), are counted in the
-  [metrics](../kvcache/metrics/README.md).
+  its groups hold it. Groups listed in `Config.IgnoredKVCacheGroups`, such as a
+  speculative-decoding draft model's group, are skipped entirely, because the
+  engine serves the prefix without them. Suppressed and forwarded removals, and
+  stores and removals skipped before indexing (`unsupported_cache_kind`,
+  `invalid_block_size`, `non_dense_block_span`, `unresolved_parent`,
+  `ignored_group`), are counted in the [metrics](../kvcache/metrics/README.md).
 
 ## Key Types
 

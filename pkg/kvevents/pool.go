@@ -130,6 +130,15 @@ type Config struct {
 	// PodDiscoveryConfig holds the configuration for pod discovery.
 	// Only used when DiscoverPods is true.
 	PodDiscoveryConfig *PodDiscoveryConfig `json:"podDiscoveryConfig,omitempty"`
+	// IgnoredKVCacheGroups lists vLLM KV cache group indices whose store and
+	// remove events never change prefix-index presence. Set it to a
+	// speculative-decoding draft model's group. vLLM does not mark that group
+	// in its events (it logs "no KV cache group could be identified as the
+	// draft model's") and evicts its blocks on its own schedule while still
+	// serving the prefix from the target model's groups. Counting its removals
+	// against the full-attention holder drops blocks the engine still holds,
+	// oldest first, so long sessions lose their first block and match nothing.
+	IgnoredKVCacheGroups []int `json:"ignoredKVCacheGroups,omitempty"`
 }
 
 // PodDiscoveryConfig holds configuration for the Kubernetes pod reconciler.
@@ -193,6 +202,8 @@ type Pool struct {
 	// tier, KV-cache group, DP rank) and a store must be counted only after
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
+	// ignoredGroups is Config.IgnoredKVCacheGroups as a set.
+	ignoredGroups map[int]struct{}
 	// tracer is resolved once: tracing.Tracer rebuilds its instrumentation
 	// options on every call, which is not free on the per-message event path.
 	// Nil when Config.Tracing is unset, which is what startSpan tests to skip
@@ -232,6 +243,12 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		tracer:         newEventTracer(cfg.Tracing),
 		stopped:        make(chan struct{}),
 	}
+	if len(cfg.IgnoredKVCacheGroups) > 0 {
+		p.ignoredGroups = make(map[int]struct{}, len(cfg.IgnoredKVCacheGroups))
+		for _, g := range cfg.IgnoredKVCacheGroups {
+			p.ignoredGroups[g] = struct{}{}
+		}
+	}
 
 	for i := 0; i < p.concurrency; i++ {
 		p.queues[i] = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*RawMessage]())
@@ -240,6 +257,16 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	metrics.Register()
 
 	return p
+}
+
+// groupIgnored reports whether events from this KV cache group are excluded
+// from prefix-index presence by Config.IgnoredKVCacheGroups.
+func (p *Pool) groupIgnored(groupIdx *int) bool {
+	if groupIdx == nil || p.ignoredGroups == nil {
+		return false
+	}
+	_, ignored := p.ignoredGroups[*groupIdx]
+	return ignored
 }
 
 // Span start options are built once. Passing them variadically at each call
@@ -573,6 +600,10 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 		switch ev := genericEvent.(type) {
 		case *BlockStoredEvent:
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
+			if p.groupIgnored(ev.GroupIdx) {
+				metrics.KVEventStoresSkipped.WithLabelValues(cacheKindLabel(ev.KVCacheSpecKind), "ignored_group").Inc()
+				continue
+			}
 
 			// Scope for reference-counting this store against duplicate removes.
 			// Mirrors the index eviction identity (pod, tier, group); DP rank is
@@ -731,6 +762,10 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 		case *BlockRemovedEvent:
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
+			if p.groupIgnored(ev.GroupIdx) {
+				metrics.KVEventRemovalsSkipped.WithLabelValues(cacheKindLabel(""), "ignored_group").Inc()
+				continue
+			}
 			// The group's cache-spec kind decides both whether the removal is
 			// indexable and which holder identity it must target, so resolve it
 			// once and reuse it below.
