@@ -569,7 +569,7 @@ KV-event metrics use the labels shown below.
 | `llm_d_epp_kv_cache_events_active_subscribers` | Gauge | - | ZMQ subscribers currently managed. |
 | `llm_d_epp_kv_cache_events_subscriber_reconnections_total` | Counter | `pod_identifier` | ZMQ subscriber reconnection attempts. |
 | `llm_d_epp_kv_cache_events_messages_received_total` | Counter | `pod_identifier` | Messages received from ZMQ subscribers. |
-| `llm_d_epp_kv_cache_events_zmq_errors_total` | Counter | `pod_identifier`, `operation` | ZMQ subscriber errors. |
+| `llm_d_epp_kv_cache_events_zmq_errors_total` | Counter | `pod_identifier`, `operation` | ZMQ subscriber errors. `operation="replay-truncated"` counts replays for a pod with no index state that started after the requested sequence because the engine no longer buffers its earliest events; the index is rebuilt from the oldest buffered event, so this is degradation, not failure. |
 | `llm_d_epp_kv_cache_events_pool_queue_depth` | Gauge | - | Messages queued across event-pool workers. |
 | `llm_d_epp_kv_cache_events_pool_capacity` | Gauge | - | Event-pool worker capacity. |
 | `llm_d_epp_kv_cache_events_replay_active` | Gauge | `pod_identifier` | 1 while a replay attempt is in flight for that subscriber; cleared on every exit path. |

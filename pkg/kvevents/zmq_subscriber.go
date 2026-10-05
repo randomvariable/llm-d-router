@@ -154,7 +154,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 	if z.replayEndpoint != "" && !z.hasLastSeq && z.canAttemptReplay() {
 		logger.Info("Requesting proactive replay on connect",
 			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint)
-		z.requestReplay(ctx, 0)
+		z.requestReplay(ctx, 0, true)
 	}
 
 	debugLogger := logger.V(logging.DEBUG)
@@ -191,7 +191,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			z.hasLastSeq = false
 			z.lastReplayFailure = time.Time{}
 			replayAttempted = true
-			z.requestReplay(ctx, 0)
+			z.requestReplay(ctx, 0, true)
 		}
 
 		if z.hasLastLiveSeq && seq == z.lastLiveSeq {
@@ -216,8 +216,27 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 				"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
 				"endpoint", z.endpoint)
 			replayAttempted = true
-			if !z.requestReplay(ctx, z.lastSeq+1) {
-				continue
+			if !z.requestReplay(ctx, z.lastSeq+1, false) {
+				// The missed events are gone (vLLM's buffer holds only the most
+				// recent buffer_steps batches), so retrying the same gap fails
+				// forever and the pod's index freezes. A missed removal could
+				// leave a stale holder, so drop this pod's state and rejoin from
+				// the oldest event the engine still buffers instead.
+				logger.Info("Gap could not be replayed, clearing this pod's index state and rejoining",
+					"lastSeq", z.lastSeq, "currentSeq", seq, "endpoint", z.endpoint)
+				z.pool.resetForSource(topic, z.sourceEndpoint)
+				z.lastSeq = 0
+				z.hasLastSeq = false
+				// Same backoff as a resumed replay attempt: dialing a new replay
+				// socket straight after closing the last one can fail.
+				select {
+				case <-time.After(replayRetryBackoff):
+				case <-ctx.Done():
+					return
+				}
+				if !z.requestReplay(ctx, 0, true) {
+					continue
+				}
 			}
 		}
 
@@ -227,7 +246,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			}
 			logger.Info("Joining mid-stream, requesting full replay",
 				"currentSeq", seq, "endpoint", z.endpoint)
-			if !z.requestReplay(ctx, 0) {
+			if !z.requestReplay(ctx, 0, true) {
 				continue
 			}
 		}
@@ -309,8 +328,17 @@ func (z *zmqSubscriber) invalidateReplay(topic string) {
 // 1. An attempt that returns without completing counts as a failure; the reason is
 // already recorded by the ZMQErrors operation counters at each exit path.
 //
+// acceptTruncatedStart is set only when the subscriber holds no state for the
+// pod (first join or after a reset). The engine buffers just its most recent
+// batches, so a full replay from 0 against a long-running engine starts at its
+// oldest buffered sequence. Accepting that start is sound with no prior state:
+// events older than the buffer can only be stores the index never saw or
+// removals of blocks it never held, so the index under-reports and heals as
+// blocks are stored again, but never claims a block the engine evicted.
+// Rejecting it, as gap replays must, leaves the pod unindexed for good.
+//
 //nolint:nonamedreturns // the deferred lifecycle recording reads the named result
-func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) (completed bool) {
+func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64, acceptTruncatedStart bool) (completed bool) {
 	logger := log.FromContext(ctx).WithName("zmq-replay")
 	debugLogger := logger.V(logging.DEBUG)
 
@@ -420,8 +448,16 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) (com
 				break
 			}
 			if seq != expectedSeq {
-				terminalErr = fmt.Errorf("incomplete replay: expected sequence %d, got %d", expectedSeq, seq)
-				break
+				if acceptTruncatedStart && replayed == 0 && attemptReplayed == 0 && seq > expectedSeq {
+					logger.Info("Replay starts after the requested sequence, earlier events are no longer buffered",
+						"requestedSeq", expectedSeq, "oldestBufferedSeq", seq,
+						"replayEndpoint", z.replayEndpoint)
+					metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-truncated").Inc()
+					expectedSeq = seq
+				} else {
+					terminalErr = fmt.Errorf("incomplete replay: expected sequence %d, got %d", expectedSeq, seq)
+					break
+				}
 			}
 
 			// Backpressure replay against the ordered worker, rather than storing

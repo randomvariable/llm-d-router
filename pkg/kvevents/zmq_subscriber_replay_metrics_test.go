@@ -96,19 +96,19 @@ func TestZMQSubscriber_ReplayMetrics_TrackCompletedReplay(t *testing.T) {
 }
 
 // TestZMQSubscriber_ReplayMetrics_TrackFailedReplay covers the failure path: a
-// replay whose history does not start where it was asked to is counted as a
-// failure, never as completed, forwards nothing, and still clears the active
-// gauge — the case a stuck-at-1 gauge would otherwise hide.
+// replay that answers with a malformed frame is counted as a failure, never as
+// completed, forwards nothing, and still clears the active gauge — the case a
+// stuck-at-1 gauge would otherwise hide. (A history that starts after sequence
+// 0 is no longer a failure on a fresh join: see
+// TestZMQSubscriber_FreshJoinAcceptsTruncatedHistory.)
 func TestZMQSubscriber_ReplayMetrics_TrackFailedReplay(t *testing.T) {
 	before := snapshotReplayMetrics(t)
 
-	h := newReplayHarness(t, []replayMessage{
-		{seq: 1, payload: buildDistinctBlockStoredPayload(t, 902)},
-	}, false)
+	newReplayHarness(t, nil, true)
 
 	require.Eventually(t, func() bool {
 		return snapshotReplayMetrics(t).failures == before.failures+1
-	}, 5*time.Second, 50*time.Millisecond, "a truncated replay must count as one failure")
+	}, 5*time.Second, 50*time.Millisecond, "a malformed replay must count as one failure")
 
 	after := snapshotReplayMetrics(t)
 	assert.Equal(t, before.completed, after.completed, "a failed replay must not be counted as completed")
@@ -116,9 +116,6 @@ func TestZMQSubscriber_ReplayMetrics_TrackFailedReplay(t *testing.T) {
 	assert.Zero(t, after.active, "the failure path must clear replay_active")
 	assert.Equal(t, before.lastCompletion, after.lastCompletion,
 		"a failure must not refresh the last successful completion stamp")
-
-	_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(902))
-	require.Error(t, err, "the rejected replay must not populate the index")
 }
 
 // TestZMQSubscriber_ReplayMetrics_ActiveTracksInFlightAttempt covers an exit the

@@ -563,14 +563,56 @@ func TestZMQSubscriber_ProactiveReplayAcceptsEndAfterProgress(t *testing.T) {
 	require.Len(t, hits[key], 1, "terminal marker after replay progress must preserve the rebuilt index")
 }
 
-func TestZMQSubscriber_ProactiveReplayRejectsTruncatedHistory(t *testing.T) {
+// TestZMQSubscriber_FreshJoinAcceptsTruncatedHistory is the regression for a
+// subscriber that never indexed anything: vLLM buffers only its last
+// buffer_steps batches, so against a long-running engine a full replay from 0
+// starts later. Rejecting that made every rejoin fail, and live events were
+// dropped behind a replay that could never succeed (observed: 117 messages
+// received, 0 index admissions). With no prior state the truncated start is
+// sound, so the buffered history and the live stream after it are indexed.
+func TestZMQSubscriber_FreshJoinAcceptsTruncatedHistory(t *testing.T) {
 	h := newReplayHarness(t, []replayMessage{
 		{seq: 1, payload: buildDistinctBlockStoredPayload(t, 200)},
 	}, false)
 
-	time.Sleep(300 * time.Millisecond)
-	_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
-	require.Error(t, err, "replay starting after the requested sequence must not populate the index")
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "buffered history after the truncated start must be indexed")
+
+	h.send(t, 2, buildDistinctBlockStoredPayload(t, 300))
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "live events after the replay must be indexed")
+}
+
+// TestZMQSubscriber_UnrecoverableGapRejoinsFromBuffer covers the steady-state
+// version of the same failure: once a gap's events have left the engine's
+// buffer, replaying lastSeq+1 fails every time and the pod's index freezes.
+// The subscriber must drop the pod's possibly stale state and rejoin from the
+// oldest buffered event instead.
+func TestZMQSubscriber_UnrecoverableGapRejoinsFromBuffer(t *testing.T) {
+	h := newReplayHarness(t, nil, false)
+	h.send(t, 0, buildDistinctBlockStoredPayload(t, 100))
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(100))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond)
+
+	// The engine has moved on: events 1-4 are gone, its buffer starts at 5.
+	h.buffer.set(replayMessage{seq: 5, payload: buildDistinctBlockStoredPayload(t, 500)})
+	h.send(t, 5, buildDistinctBlockStoredPayload(t, 500))
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(500))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "the rejoin must index the buffered history")
+
+	h.send(t, 6, buildDistinctBlockStoredPayload(t, 600))
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(600))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "live events after the rejoin must be indexed")
 }
 
 func TestZMQSubscriber_ProactiveReplayClearsPartialHistoryOnGap(t *testing.T) {

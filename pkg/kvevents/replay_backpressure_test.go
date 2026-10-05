@@ -57,7 +57,7 @@ func TestReplayWaitsForProcessing(t *testing.T) {
 			}()
 			z := newZMQSubscriber(pool, "pod", "source", "", endpoint, "topic", true)
 			result := make(chan bool, 1)
-			go func() { result <- z.requestReplay(ctx, 0) }()
+			go func() { result <- z.requestReplay(ctx, 0, false) }()
 			select {
 			case <-adapter.entered:
 			case <-ctx.Done():
