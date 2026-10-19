@@ -788,7 +788,7 @@ func responsesReferenceOnly(body *fwkrh.InferenceRequestBody) bool {
 	if !inputEmpty {
 		return false
 	}
-	if m, ok := body.WirePayload().(fwkrh.PayloadMap); ok {
+	if m := payloadMap(body); m != nil {
 		if ref, ok := m["previous_response_id"].(string); ok && ref != "" {
 			return true
 		}

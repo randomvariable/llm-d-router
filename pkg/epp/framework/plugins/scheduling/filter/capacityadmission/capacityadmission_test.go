@@ -738,6 +738,7 @@ func TestReferenceOnlyBoundRTXRejectedNeverMovedOrAdmitted(t *testing.T) {
 
 	// Reference-only Responses for the same session: rejected clearly.
 	ref := responsesRequest("ro-t2", combinedMdl, "sess-ro", nil, "resp-1", nil)
+	ref.Body.RawBody = []byte(`{"model":"qwen38-flash-next","previous_response_id":"resp-1"}`)
 	out := p.Filter(ctx, ref, []fwksched.Endpoint{dgxEndpoint(), rtxEndpoint()})
 	require.Len(t, out, 1, "reference-only is unaccountable: RTX is dropped from its candidates")
 	require.False(t, p.isRTX(out[0]))
