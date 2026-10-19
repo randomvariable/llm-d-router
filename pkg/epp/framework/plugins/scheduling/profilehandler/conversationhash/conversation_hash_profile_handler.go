@@ -24,7 +24,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"maps"
 	"slices"
 	"strings"
@@ -34,26 +33,13 @@ import (
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
-	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/util/conversation"
 )
 
 const (
 	// ConversationHashProfileHandlerType is the type of the ConversationHashProfileHandler.
 	ConversationHashProfileHandlerType = "conversation-hash-profile-handler"
-
-	// roleSeparator and messageSeparator keep the serialisation of a conversation
-	// root injective: without them "a"+"bc" and "ab"+"c" would hash alike and two
-	// different conversations would share an arm.
-	roleSeparator    = "\x00"
-	messageSeparator = "\x01"
-
-	roleSystem    = "system"
-	roleDeveloper = "developer"
-	roleUser      = "user"
-
-	// textBlockType is the only Anthropic content block that carries prompt text.
-	textBlockType = "text"
 )
 
 // parameters configures the ConversationHashProfileHandler.
@@ -197,8 +183,8 @@ func (h *ConversationHashProfileHandler) Pick(ctx context.Context, request *fwks
 
 	selected := h.defaultProfile
 	var hash uint64
-	if root, ok := conversationRoot(request); ok {
-		hash = fnv1a64(root)
+	if root, ok := conversation.Root(request); ok {
+		hash = conversation.Hash(root)
 		selected = h.profileFor(hash)
 	}
 
@@ -281,86 +267,4 @@ func (h *ConversationHashProfileHandler) warnUnknownProfile(ctx context.Context,
 	log.FromContext(ctx).Info("hashed profile is not configured, falling back to defaultProfile",
 		"profileName", profileName, "defaultProfile", h.defaultProfile,
 		"registeredProfiles", registered)
-}
-
-// conversationRoot returns the leading system/developer instructions plus the
-// first user message, serialised so it is stable across the turns of one
-// conversation. It reports false when no root can be extracted, which routes
-// the request to defaultProfile: a body the parsers did not fill (legacy
-// completions, an unparsed payload, or the responses API whose Input and
-// Instructions are untyped) is not worth guessing at, since the traffic this
-// pool serves is chat completions.
-func conversationRoot(request *fwksched.InferenceRequest) (string, bool) {
-	if request == nil || request.Body == nil {
-		return "", false
-	}
-
-	var parts []string
-	switch {
-	case request.Body.ChatCompletions != nil:
-		var sawUser bool
-		for _, message := range request.Body.ChatCompletions.Messages {
-			role := strings.ToLower(strings.TrimSpace(message.Role))
-			if role == roleSystem || role == roleDeveloper {
-				parts = append(parts, role+roleSeparator+message.Content.PlainText())
-				continue
-			}
-			if role == roleUser {
-				parts = append(parts, role+roleSeparator+message.Content.PlainText())
-				sawUser = true
-			}
-			break // the root ends at the first non-instruction message
-		}
-		if !sawUser {
-			// Instructions alone are not a conversation. Assigning them an arm by
-			// hash would be wrong twice over: the same session lands on a different
-			// arm as soon as its first user message arrives, because the root grows.
-			return "", false
-		}
-	case request.Body.Messages != nil:
-		var sawUser bool
-		if system := anthropicPlainText(request.Body.Messages.System); system != "" {
-			parts = append(parts, roleSystem+roleSeparator+system)
-		}
-		for _, message := range request.Body.Messages.Messages {
-			if strings.EqualFold(strings.TrimSpace(message.Role), roleUser) {
-				parts = append(parts, roleUser+roleSeparator+anthropicPlainText(message.Content))
-				sawUser = true
-			}
-			break
-		}
-		if !sawUser {
-			return "", false
-		}
-	default:
-		return "", false
-	}
-	if len(parts) == 0 {
-		return "", false
-	}
-	return strings.Join(parts, messageSeparator), true
-}
-
-// anthropicPlainText flattens an Anthropic content value to text. The
-// requesthandling package exposes only a length for this type, so the plugin
-// owns the text form; non-text blocks are skipped for the same reason the
-// OpenAI flattener skips them - their bytes are not part of the prompt text.
-func anthropicPlainText(content fwkrh.AnthropicContent) string {
-	if content.Raw != "" {
-		return content.Raw
-	}
-	var builder strings.Builder
-	for _, block := range content.Structured {
-		if block.Type == textBlockType {
-			builder.WriteString(block.Text)
-			builder.WriteString(" ")
-		}
-	}
-	return builder.String()
-}
-
-func fnv1a64(text string) uint64 {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(text)) // hash.Hash.Write never returns an error
-	return hasher.Sum64()
 }

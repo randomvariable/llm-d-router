@@ -29,6 +29,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/util/conversation"
 )
 
 type fakeSchedulerProfile struct{ label string }
@@ -226,9 +227,9 @@ func TestUnknownHashedProfileFallsBackToDefault(t *testing.T) {
 	resetMetrics()
 	for i := range 500 {
 		request := chatRequest(fmt.Sprintf("sys %d", i), "u", 0)
-		root, ok := conversationRoot(request)
+		root, ok := conversation.Root(request)
 		require.True(t, ok)
-		if handler.profileFor(fnv1a64(root)) != "C" {
+		if handler.profileFor(conversation.Hash(root)) != "C" {
 			continue
 		}
 		result := handler.Pick(context.Background(), request, profiles, map[string]*fwksched.ProfileRunResult{})
